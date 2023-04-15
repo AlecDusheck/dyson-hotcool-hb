@@ -15,58 +15,33 @@ import nodePersist from "node-persist";
 import ping from "ping";
 import * as constants from "./constants";
 import * as messages from "./messages";
+import {v4 as uuidv4} from 'uuid';
 
 export = (api: API) => {
     api.registerAccessory(constants.ACCESSORY_NAME, DysonBP01);
 };
 
-/**
- * Dyson BP01 accessory for Homebridge
- *
- * @author Jeremy Noesen
- */
+type DeviceState = {
+    power: "OFF" | "ON",
+    speed: number,
+    isSwinging: boolean,
+    airDirection: "STRAIGHT" | "WIDE"
+}
+
+type QueuedCommand = {
+    irData: string,
+    stateChange: Partial<DeviceState>,
+    id?: string
+};
+
 class DysonBP01 implements AccessoryPlugin {
-
-    /**
-     * Homebridge logging instance
-     * @private
-     */
     private readonly logging: Logging;
-
-    /**
-     * Homebridge HAP instance
-     * @private
-     */
     private readonly hap: HAP;
-
-    /**
-     * Accessory config options
-     * @private
-     */
     private readonly accessoryConfig: AccessoryConfig;
-
-    /**
-     * BroadLinkJS library
-     * @private
-     */
     private readonly broadLinkJS: BroadLinkJS;
-
-    /**
-     * BroadLink RM device
-     * @private
-     */
     private device: any;
-
-    /**
-     * Last ping status of the BroadLink RM
-     * @private
-     */
     private alive: boolean;
 
-    /**
-     * Node-persist storage
-     * @private
-     */
     private readonly localStorage: nodePersist.LocalStorage;
 
     /**
@@ -75,45 +50,20 @@ class DysonBP01 implements AccessoryPlugin {
      */
     private readonly services: {
         readonly accessoryInformation: Service,
-        readonly fanV2: Service,
-        readonly temperatureSensor: Service,
-        readonly humiditySensor: Service
+        readonly fan: Service
     };
 
     /**
-     * Characteristics for the fanV2 service, which are also saved to storage
+     * Cached device state (saved to local storage)
      * @private
      */
-    private fanV2Characteristics: {
-        targetActive: number,
-        currentActive: number,
-        targetRotationSpeed: number,
-        currentRotationSpeed: number,
-        targetSwingMode: number,
-        currentSwingMode: number
-    };
+    private _deviceState: DeviceState;
+
+    private devicePingFail: number;
+    private commandQueue: Array<QueuedCommand>
 
     /**
-     * Characteristics for the sensors, which are not saved to storage
-     * @private
-     */
-    private readonly sensorCharacteristics: {
-        currentTemperature: number,
-        currentRelativeHumidity: number
-    };
-
-    /**
-     * Skips applied after certain events
-     * @private
-     */
-    private readonly skips: {
-        updateCurrentActive: number,
-        updateCurrentSwingMode: number,
-        devicePingFail: number
-    };
-
-    /**
-     * Create DysonBP01 accessory
+     * Create accessory
      * @param logging Homebridge logging instance
      * @param accessoryConfig Homebridge accessory config
      * @param api Homebridge API
@@ -123,467 +73,270 @@ class DysonBP01 implements AccessoryPlugin {
         this.hap = api.hap;
         this.accessoryConfig = accessoryConfig;
         this.broadLinkJS = new BroadLinkJS();
-        this.device = null;
+        this.device = undefined;
         this.alive = false;
         this.localStorage = nodePersist.create();
+
         this.services = {
             accessoryInformation: new this.hap.Service.AccessoryInformation(),
-            fanV2: new this.hap.Service.Fanv2(this.accessoryConfig.name),
-            temperatureSensor: new this.hap.Service.TemperatureSensor(),
-            humiditySensor: new this.hap.Service.HumiditySensor()
+            fan: new this.hap.Service.Fanv2(this.accessoryConfig.name),
         };
-        this.fanV2Characteristics = {
-            targetActive: this.hap.Characteristic.Active.INACTIVE,
-            currentActive: this.hap.Characteristic.Active.INACTIVE,
-            targetRotationSpeed: constants.ROTATION_SPEED_STEP_SIZE,
-            currentRotationSpeed: constants.ROTATION_SPEED_STEP_SIZE,
-            targetSwingMode: this.hap.Characteristic.SwingMode.SWING_DISABLED,
-            currentSwingMode: this.hap.Characteristic.SwingMode.SWING_DISABLED
+
+        this._deviceState = {
+            airDirection: "STRAIGHT",
+            isSwinging: false,
+            power: "ON",
+            speed: 1,
         };
-        this.sensorCharacteristics = {
-            currentTemperature: 0,
-            currentRelativeHumidity: 0
-        };
-        this.skips = {
-            updateCurrentActive: 0,
-            updateCurrentSwingMode: 0,
-            devicePingFail: 0
-        };
+
+        this.commandQueue = [];
+
+        this.devicePingFail = 0;
+
+        // Update the cached device state from local storage
         this.localStorage.init({
             dir: api.user.persistPath(),
             forgiveParseErrors: true
         }).then(() => {
-            this.initFanV2Characteristics().then(() => {
-                this.initDevice();
+            this.updateCachedState().then(() => {
+                this.configureBroadLink();
                 this.initInterval();
             });
         });
+
         this.initServices();
     }
 
     /**
-     * Identify accessory by toggling Active
+     * Explicit setter for `deviceState` that will update local storage
+     * @param state
      */
-    identify(): void {
-        if (this.alive) {
-            this.logging.info(messages.IDENTIFYING);
-            let toggleCount: number = 0;
-            let activeToggle: NodeJS.Timer = setInterval(async () => {
-                if (toggleCount < constants.IDENTIFY_ACTIVE_TOGGLE_COUNT) {
-                    if (this.fanV2Characteristics.targetActive == this.hap.Characteristic.Active.ACTIVE) {
-                        await this.setTargetActive(this.hap.Characteristic.Active.INACTIVE, () => {
-                        });
-                    } else if (this.fanV2Characteristics.targetActive == this.hap.Characteristic.Active.INACTIVE) {
-                        await this.setTargetActive(this.hap.Characteristic.Active.ACTIVE, () => {
-                        });
+    set deviceState(state: DeviceState) {
+        this._deviceState = state;
+
+        // In the background, update cached state
+        this.localStorage.setItem(this.accessoryConfig.name, this._deviceState).then(() => {});
+    }
+
+    get deviceState() {
+        return this._deviceState;
+    }
+
+    private emulateCompletedState(): DeviceState {
+        const mockState = {...this.deviceState};
+        this.commandQueue.forEach(x => this.processStateChange(x.stateChange, mockState));
+        return mockState;
+    }
+
+    private initInterval(): void {
+        // Interval to decrease cooldowns and failed pings
+        setInterval(async () => {
+            if (this.device) {
+                if (this.alive) {
+                    const command = this.commandQueue.shift();
+                    if (command) {
+                        await this.sendBroadLinkData(command.irData);
+                        const currentState = this.deviceState;
+
+                        // Process stateful changes
+                        this.processStateChange(command.stateChange, currentState);
+
+                        // Done to trigger custom setters/getters
+                        this.deviceState = currentState;
                     }
-                    toggleCount++;
-                } else if (this.fanV2Characteristics.targetActive == this.fanV2Characteristics.currentActive) {
-                    clearInterval(activeToggle);
-                    this.logging.info(messages.IDENTIFIED);
+                    // if (this.canUpdateCurrentActive()) {
+                    //     await this.updateCurrentActive();
+                    // } else if (this.canUpdateCurrentRotationSpeed()) {
+                    //     await this.updateCurrentRotationSpeed();
+                    // } else if (this.canUpdateCurrentSwingMode()) {
+                    //     await this.updateCurrentSwingMode();
+                    // }
                 }
-            }, constants.INTERVAL);
+            }
+        }, 700);
+
+        // Interval to ping device
+        setInterval(async () => {
+            if (this.device) {
+                await this.pingDevice();
+            } else {
+                this.broadLinkJS.discover();
+            }
+
+            if (this.devicePingFail > 0) {
+                this.devicePingFail--;
+
+                if (this.devicePingFail == 0) {
+                    this.logging.info(messages.DEVICE_PING_STABILIZED);
+                }
+            }
+        }, 700);
+    }
+
+    private processStateChange(partialState: Partial<DeviceState>, state: DeviceState) {
+        for (let key in partialState) {
+            // in the case of numbers, add
+            if (typeof partialState[key] === "number") {
+                state[key] += partialState[key];
+            } else {
+                state[key] = partialState[key];
+            }
         }
     }
 
     /**
-     * Set interval that updates accessory states
+     * Push a command to the queue, with the ability to call a HAP command after the command has been processed
+     * @param command
+     * @param characteristicSetCallback
      * @private
      */
-    private initInterval(): void {
-        setInterval(async () => {
-            if (this.device == null) {
-                this.broadLinkJS.discover();
-            } else {
-                await this.pingDevice();
-                if (this.alive) {
-                    if (this.canUpdateCurrentActive()) {
-                        await this.updateCurrentActive();
-                    } else if (this.canUpdateCurrentRotationSpeed()) {
-                        await this.updateCurrentRotationSpeed();
-                    } else if (this.canUpdateCurrentSwingMode()) {
-                        await this.updateCurrentSwingMode();
-                    }
-                    if (this.accessoryConfig.exposeSensors) {
-                        this.device.checkTemperature();
-                    }
-                }
-                this.doUpdateCurrentActiveSkip();
-                this.doUpdateCurrentSwingModeSkip();
-                this.doDevicePingFailSkip();
+    private pushToQueue(command: QueuedCommand, characteristicSetCallback?: CharacteristicSetCallback) {
+        if (!this.alive) {
+            if (characteristicSetCallback) {
+                characteristicSetCallback(new Error(`Device ping failed`));
             }
-        }, constants.INTERVAL);
+
+            return;
+        }
+
+        const commandWithId = {
+            ...command,
+            id: uuidv4(),
+        };
+        this.commandQueue.push(commandWithId);
+
+        // If no callback is given, return without waiting
+        if (!characteristicSetCallback) {
+            return;
+        }
+
+        const interval = setInterval(() => {
+            if (!this.commandQueue.find(x => x.id === commandWithId.id)) {
+                clearInterval(interval);
+                characteristicSetCallback()
+            }
+        }, 700);
     }
 
-    /**
-     * Initialize services for accessory
-     * @private
-     */
     private initServices(): void {
         this.services.accessoryInformation
             .updateCharacteristic(this.hap.Characteristic.Manufacturer, messages.INFO_MANUFACTURER)
             .updateCharacteristic(this.hap.Characteristic.Model, messages.INFO_MODEL)
             .updateCharacteristic(this.hap.Characteristic.SerialNumber,
                 this.accessoryConfig.serialNumber.toUpperCase());
-        this.services.fanV2.getCharacteristic(this.hap.Characteristic.Active)
-            .on(CharacteristicEventTypes.GET, this.getTargetActive.bind(this))
-            .on(CharacteristicEventTypes.SET, this.setTargetActive.bind(this));
-        this.services.fanV2.getCharacteristic(this.hap.Characteristic.RotationSpeed)
-            .on(CharacteristicEventTypes.GET, this.getTargetRotationSpeed.bind(this))
-            .on(CharacteristicEventTypes.SET, this.setTargetRotationSpeed.bind(this))
-            .setProps({
-                minStep: constants.ROTATION_SPEED_STEP_SIZE
-            });
-        this.services.fanV2.getCharacteristic(this.hap.Characteristic.SwingMode)
-            .on(CharacteristicEventTypes.GET, this.getTargetSwingMode.bind(this))
-            .on(CharacteristicEventTypes.SET, this.setTargetSwingMode.bind(this));
-        if (this.accessoryConfig.exposeSensors) {
-            this.services.temperatureSensor.getCharacteristic(this.hap.Characteristic.CurrentTemperature)
-                .on(CharacteristicEventTypes.GET, this.getCurrentTemperature.bind(this));
-            this.services.humiditySensor.getCharacteristic(this.hap.Characteristic.CurrentRelativeHumidity)
-                .on(CharacteristicEventTypes.GET, this.getCurrentRelativeHumidity.bind(this));
-        }
+
+        this.services.fan.getCharacteristic(this.hap.Characteristic.Active)
+            .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(() => this.deviceState.power).bind(this))
+            .on(CharacteristicEventTypes.SET, this.setPower.bind(this));
+
+        this.services.fan.getCharacteristic(this.hap.Characteristic.CurrentFanState)
+            .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(() => {
+                if (this.deviceState.power === "ON") {
+                    return this.hap.Characteristic.CurrentFanState.BLOWING_AIR;
+                }
+
+                return this.hap.Characteristic.CurrentFanState.IDLE
+            }).bind(this));
+
+        /*
+        this.services.fan.getCharacteristic(this.hap.Characteristic.Active)
+            .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(() => this.deviceState.isSwinging).bind(this))
+            .on(CharacteristicEventTypes.SET, this.setSwingMode.bind(this));
+
+        this.services.fan.getCharacteristic(this.hap.Characteristic.RotationSpeed)
+            .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(() => this.deviceState.targetSpeed).bind(this))
+            .on(CharacteristicEventTypes.SET, this.setCurrentSpeed.bind(this));
+
+        // Rotation Direction = Air Straight or Wide
+        this.services.fan.getCharacteristic(this.hap.Characteristic.RotationDirection)
+            .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(() => {
+                if (this.deviceState.airDirection === "STRAIGHT") {
+                    return this.hap.Characteristic.RotationDirection.CLOCKWISE;
+                }
+
+                return this.hap.Characteristic.RotationDirection.COUNTER_CLOCKWISE;
+            }).bind(this))
+            .on(CharacteristicEventTypes.SET, this.setRotationDirection.bind(this));
+         */
     }
 
-    /**
-     * Get services for accessory
-     */
-    getServices(): Service[] {
-        let services: Service[] = [
+    public getServices(): Service[] {
+        return [
             this.services.accessoryInformation,
-            this.services.fanV2
+            this.services.fan
         ];
-        if (this.accessoryConfig.exposeSensors) {
-            services.push(
-                this.services.temperatureSensor,
-                this.services.humiditySensor
-            );
-        }
-        return services;
     }
 
-    /**
-     * Initialize the BroadLink RM
-     * @private
-     */
-    private initDevice(): void {
+    private configureBroadLink(): void {
         this.broadLinkJS.on("deviceReady", device => {
             let macAddress: string = device.mac.toString("hex").replace(/(.{2})/g, "$1:").slice(0, -1).toUpperCase();
-            this.logging.info(messages.DEVICE_DISCOVERED, macAddress);
+            this.logging.info(`Found device w/ MAC: ${macAddress}`);
             if (this.device == null && (this.accessoryConfig.macAddress == undefined ||
                 this.accessoryConfig.macAddress.toUpperCase() == macAddress)) {
                 this.device = device;
-                if (this.accessoryConfig.exposeSensors) {
-                    this.device.on("temperature", (temp, humidity) => {
-                        this.setCurrentTemperature(temp);
-                        this.setCurrentRelativeHumidity(humidity);
-                    });
-                }
-                this.logging.info(messages.DEVICE_USING, macAddress);
+
+                this.logging.info(`Device set to be used w/ MAC: ${macAddress}`);
             }
         });
-        this.logging.info(messages.DEVICE_DISCOVERING);
+        this.logging.info(`Discovering device...`);
     }
 
-    /**
-     * Ping the BroadLink RM to check if it is connected
-     * @private
-     */
     private async pingDevice(): Promise<void> {
+        // Probe device status and update `this.alive` with data
         this.alive = await ping.promise.probe(this.device.host.address).then((pingResponse) => {
             return pingResponse.alive;
         });
+
         if (!this.alive) {
-            if (this.skips.devicePingFail == 0) {
+            if (this.devicePingFail == 0) {
                 this.logging.info(messages.DEVICE_PING_FAILED);
             }
-            this.skips.devicePingFail = constants.SKIPS_DEVICE_PING_FAIL;
-        } else if (this.skips.devicePingFail > 0) {
-            if (this.skips.devicePingFail == constants.SKIPS_DEVICE_PING_FAIL - 1) {
+
+            this.devicePingFail = constants.SKIPS_DEVICE_PING_FAIL;
+        } else if (this.devicePingFail > 0) {
+            if (this.devicePingFail == constants.SKIPS_DEVICE_PING_FAIL - 1) {
                 this.logging.info(messages.DEVICE_PING_STABILIZING);
             }
             this.alive = false;
         }
     }
 
-    /**
-     * Send IR data to the BroadLink RM
-     * @param data IR data as a hex string
-     * @private
-     */
-    private sendDeviceData(data: string): void {
+    private sendBroadLinkData(data: string): void {
         this.device.sendData(Buffer.from(data, "hex"));
     }
 
+    private async updateCachedState(): Promise<void> {
+        this.deviceState =
+            await this.localStorage.getItem(this.accessoryConfig.name) || this.deviceState;
+        this.logging.info("Updated cached device state", JSON.stringify(this.deviceState));
+    }
+
     /**
-     * Decrement device ping fail skips
+     * Returns a bindable function that returns a `characteristicGetCallback` for the value returned by `getter`
+     * @param getter
      * @private
      */
-    private doDevicePingFailSkip(): void {
-        if (this.skips.devicePingFail > 0) {
-            this.skips.devicePingFail--;
-            if (this.skips.devicePingFail == 0) {
-                this.logging.info(messages.DEVICE_PING_STABILIZED);
-            }
+    private getCharacteristicProperty<T extends CharacteristicValue>(getter: () => T): (characteristicGetCallback: CharacteristicGetCallback) => void {
+        return (characteristicGetCallback: CharacteristicGetCallback) => {
+            characteristicGetCallback(this.alive ? null : new Error(messages.DEVICE_PING_FAILED),
+                getter());
         }
     }
 
-    /**
-     * Initialize fanV2 characteristics from persist storage or defaults
-     * @private
-     */
-    private async initFanV2Characteristics(): Promise<void> {
-        this.fanV2Characteristics =
-            await this.localStorage.getItem(this.accessoryConfig.name) || this.fanV2Characteristics;
-        this.logging.info(messages.INIT_TARGET_ACTIVE, this.fanV2Characteristics.targetActive);
-        this.logging.info(messages.INIT_CURRENT_ACTIVE, this.fanV2Characteristics.currentActive);
-        this.logging.info(messages.INIT_TARGET_ROTATION_SPEED, this.fanV2Characteristics.targetRotationSpeed);
-        this.logging.info(messages.INIT_CURRENT_ROTATION_SPEED, this.fanV2Characteristics.currentRotationSpeed);
-        this.logging.info(messages.INIT_TARGET_SWING_MODE, this.fanV2Characteristics.targetSwingMode);
-        this.logging.info(messages.INIT_CURRENT_SWING_MODE, this.fanV2Characteristics.currentSwingMode);
-    }
-
-    /**
-     * Update fanV2 characteristics in persist storage
-     * @private
-     */
-    private async updateFanV2Characteristics(): Promise<void> {
-        await this.localStorage.setItem(this.accessoryConfig.name, this.fanV2Characteristics);
-    }
-
-    /**
-     * Get target Active
-     * @param characteristicGetCallback Characteristic get callback
-     * @private
-     */
-    private getTargetActive(characteristicGetCallback: CharacteristicGetCallback): void {
-        characteristicGetCallback(this.alive ? null : new Error(messages.DEVICE_PING_FAILED),
-            this.fanV2Characteristics.targetActive);
-    }
-
-    /**
-     * Set target Active
-     * @param characteristicValue New characteristic value to set
-     * @param characteristicSetCallback Characteristic set callback
-     * @private
-     */
-    private async setTargetActive(characteristicValue: CharacteristicValue,
+    private async setPower(characteristicValue: CharacteristicValue,
                                   characteristicSetCallback: CharacteristicSetCallback): Promise<void> {
-        if (this.alive) {
-            if (characteristicValue as number != this.fanV2Characteristics.targetActive) {
-                this.fanV2Characteristics.targetActive = characteristicValue as number;
-                await this.updateFanV2Characteristics();
-                this.logging.info(messages.SET_TARGET_ACTIVE, this.fanV2Characteristics.targetActive);
-            }
-            characteristicSetCallback();
-        } else {
-            characteristicSetCallback(new Error(messages.DEVICE_PING_FAILED));
-        }
-    }
+        const state = this.emulateCompletedState();
+        const hapMapping = {
+            "OFF": 0,
+            "ON": 1,
+        }[state.power];
 
-    /**
-     * Check if current Active can be updated
-     * @private
-     */
-    private canUpdateCurrentActive(): boolean {
-        return this.fanV2Characteristics.currentActive != this.fanV2Characteristics.targetActive &&
-            this.skips.updateCurrentActive == 0 &&
-            this.skips.updateCurrentSwingMode == 0;
-    }
-
-    /**
-     * Update current Active based on target Active
-     * @private
-     */
-    private async updateCurrentActive(): Promise<void> {
-        this.sendDeviceData(constants.IR_DATA_ACTIVE);
-        this.fanV2Characteristics.currentActive = this.fanV2Characteristics.targetActive;
-        if (this.fanV2Characteristics.currentActive == this.hap.Characteristic.Active.ACTIVE) {
-            this.skips.updateCurrentActive = constants.SKIPS_UPDATE_CURRENT_ACTIVE_ACTIVE;
-        } else if (this.fanV2Characteristics.currentActive == this.hap.Characteristic.Active.INACTIVE) {
-            this.skips.updateCurrentActive = constants.SKIPS_UPDATE_CURRENT_ACTIVE_INACTIVE;
-        }
-        await this.updateFanV2Characteristics();
-        this.logging.info(messages.UPDATED_CURRENT_ACTIVE, this.fanV2Characteristics.currentActive);
-    }
-
-    /**
-     * Decrement update current Active skips
-     * @private
-     */
-    private doUpdateCurrentActiveSkip(): void {
-        if (this.skips.updateCurrentActive > 0) {
-            this.skips.updateCurrentActive--;
-        }
-    }
-
-    /**
-     * Get target Rotation Speed
-     * @param characteristicGetCallback Characteristic get callback
-     * @private
-     */
-    private getTargetRotationSpeed(characteristicGetCallback: CharacteristicGetCallback): void {
-        characteristicGetCallback(this.alive ? null : new Error(messages.DEVICE_PING_FAILED),
-            this.fanV2Characteristics.targetRotationSpeed);
-    }
-
-    /**
-     * Set target Rotation Speed
-     * @param characteristicValue New characteristic value to set
-     * @param characteristicSetCallback Characteristic set callback
-     * @private
-     */
-    private async setTargetRotationSpeed(characteristicValue: CharacteristicValue,
-                                         characteristicSetCallback: CharacteristicSetCallback): Promise<void> {
-        if (this.alive) {
-            let clampedCharacteristicValue: number = characteristicValue as number;
-            if (clampedCharacteristicValue < constants.ROTATION_SPEED_STEP_SIZE) {
-                clampedCharacteristicValue = constants.ROTATION_SPEED_STEP_SIZE;
-                this.services.fanV2.updateCharacteristic(this.hap.Characteristic.RotationSpeed,
-                    clampedCharacteristicValue);
-            }
-            if (clampedCharacteristicValue != this.fanV2Characteristics.targetRotationSpeed) {
-                this.fanV2Characteristics.targetRotationSpeed = clampedCharacteristicValue;
-                await this.updateFanV2Characteristics();
-                this.logging.info(messages.SET_TARGET_ROTATION_SPEED, this.fanV2Characteristics.targetRotationSpeed);
-            }
-            characteristicSetCallback();
-        } else {
-            characteristicSetCallback(new Error(messages.DEVICE_PING_FAILED));
-        }
-    }
-
-    /**
-     * Check if current Rotation Speed can be updated
-     * @private
-     */
-    private canUpdateCurrentRotationSpeed(): boolean {
-        return this.fanV2Characteristics.currentRotationSpeed != this.fanV2Characteristics.targetRotationSpeed &&
-            this.fanV2Characteristics.currentActive == this.hap.Characteristic.Active.ACTIVE &&
-            this.skips.updateCurrentActive == 0 &&
-            this.skips.updateCurrentSwingMode == 0;
-    }
-
-    /**
-     * Update current Rotation Speed based on target Rotation Speed
-     * @private
-     */
-    private async updateCurrentRotationSpeed(): Promise<void> {
-        if (this.fanV2Characteristics.currentRotationSpeed < this.fanV2Characteristics.targetRotationSpeed) {
-            this.sendDeviceData(constants.IR_DATA_ROTATION_SPEED_UP);
-            this.fanV2Characteristics.currentRotationSpeed += constants.ROTATION_SPEED_STEP_SIZE;
-        } else if (this.fanV2Characteristics.currentRotationSpeed > this.fanV2Characteristics.targetRotationSpeed) {
-            this.sendDeviceData(constants.IR_DATA_ROTATION_SPEED_DOWN);
-            this.fanV2Characteristics.currentRotationSpeed -= constants.ROTATION_SPEED_STEP_SIZE;
-        }
-        await this.updateFanV2Characteristics();
-        this.logging.info(messages.UPDATED_CURRENT_ROTATION_SPEED, this.fanV2Characteristics.currentRotationSpeed);
-    }
-
-    /**
-     * Get target Swing Mode
-     * @param characteristicGetCallback Characteristic get callback
-     * @private
-     */
-    private getTargetSwingMode(characteristicGetCallback: CharacteristicGetCallback): void {
-        characteristicGetCallback(this.alive ? null : new Error(messages.DEVICE_PING_FAILED),
-            this.fanV2Characteristics.targetSwingMode);
-    }
-
-    /**
-     * Set target Swing Mode
-     * @param characteristicValue New characteristic value to set
-     * @param characteristicSetCallback Characteristic set callback
-     * @private
-     */
-    private async setTargetSwingMode(characteristicValue: CharacteristicValue,
-                                     characteristicSetCallback: CharacteristicSetCallback): Promise<void> {
-        if (this.alive) {
-            if (characteristicValue as number != this.fanV2Characteristics.targetSwingMode) {
-                this.fanV2Characteristics.targetSwingMode = characteristicValue as number;
-                await this.updateFanV2Characteristics();
-                this.logging.info(messages.SET_TARGET_SWING_MODE, this.fanV2Characteristics.targetSwingMode);
-            }
-            characteristicSetCallback();
-        } else {
-            characteristicSetCallback(new Error(messages.DEVICE_PING_FAILED));
-        }
-    }
-
-    /**
-     * Check if current Swing Mode can be updated
-     * @private
-     */
-    private canUpdateCurrentSwingMode(): boolean {
-        return this.fanV2Characteristics.currentSwingMode != this.fanV2Characteristics.targetSwingMode &&
-            this.fanV2Characteristics.currentActive == this.hap.Characteristic.Active.ACTIVE &&
-            this.skips.updateCurrentActive == 0;
-    }
-
-    /**
-     * Update current Swing Mode based on target Swing Mode
-     * @private
-     */
-    private async updateCurrentSwingMode(): Promise<void> {
-        this.sendDeviceData(constants.IR_DATA_SWING_MODE);
-        this.fanV2Characteristics.currentSwingMode = this.fanV2Characteristics.targetSwingMode;
-        this.skips.updateCurrentSwingMode = constants.SKIPS_UPDATE_CURRENT_SWING_MODE;
-        await this.updateFanV2Characteristics();
-        this.logging.info(messages.UPDATED_CURRENT_SWING_MODE, this.fanV2Characteristics.currentSwingMode);
-    }
-
-    /**
-     * Decrement update current Swing Mode skips
-     * @private
-     */
-    private doUpdateCurrentSwingModeSkip(): void {
-        if (this.skips.updateCurrentSwingMode > 0) {
-            this.skips.updateCurrentSwingMode--;
-        }
-    }
-
-    /**
-     * Get Current Temperature
-     * @param characteristicGetCallback Characteristic get callback
-     * @private
-     */
-    private getCurrentTemperature(characteristicGetCallback: CharacteristicGetCallback): void {
-        characteristicGetCallback(this.alive ? null : new Error(messages.DEVICE_PING_FAILED),
-            this.sensorCharacteristics.currentTemperature);
-    }
-
-    /**
-     * Set Current Temperature
-     * @param characteristicValue New characteristic value to set
-     * @private
-     */
-    private setCurrentTemperature(characteristicValue: CharacteristicValue): void {
-        if (characteristicValue as number != this.sensorCharacteristics.currentTemperature) {
-            this.sensorCharacteristics.currentTemperature = characteristicValue as number;
-            this.logging.info(messages.SET_CURRENT_TEMPERATURE, this.sensorCharacteristics.currentTemperature);
-        }
-    }
-
-    /**
-     * Get Current Relative Humidity
-     * @param characteristicGetCallback Characteristic get callback
-     * @private
-     */
-    private getCurrentRelativeHumidity(characteristicGetCallback: CharacteristicGetCallback): void {
-        characteristicGetCallback(this.alive ? null : new Error(messages.DEVICE_PING_FAILED),
-            this.sensorCharacteristics.currentRelativeHumidity);
-    }
-
-    /**
-     * Set Current Relative Humidity
-     * @param characteristicValue New characteristic value to set
-     * @private
-     */
-    private setCurrentRelativeHumidity(characteristicValue: CharacteristicValue): void {
-        if (characteristicValue as number != this.sensorCharacteristics.currentRelativeHumidity) {
-            this.sensorCharacteristics.currentRelativeHumidity = characteristicValue as number;
-            this.logging.info(messages.SET_CURRENT_RELATIVE_HUMIDITY,
-                this.sensorCharacteristics.currentRelativeHumidity);
+        if (characteristicValue as number != hapMapping) {
+            this.pushToQueue({
+                irData: constants.IR_DATA_POWER,
+                stateChange: {
+                    power: hapMapping === 0 ? "OFF" : "ON"
+                }}, characteristicSetCallback);
         }
     }
 }
