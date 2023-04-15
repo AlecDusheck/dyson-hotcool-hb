@@ -25,6 +25,11 @@ type DeviceState = {
     airDirection: "STRAIGHT" | "WIDE"
 }
 
+const powerHapMapping = {
+    "OFF": 0,
+    "ON": 1,
+};
+
 type QueuedCommand = {
     irData: string,
     stateChange: Partial<DeviceState>,
@@ -150,7 +155,7 @@ export class DysonBP01 implements AccessoryPlugin {
                     // }
                 }
             }
-        }, 700);
+        }, 300);
 
         // Interval to ping device
         setInterval(async () => {
@@ -167,7 +172,7 @@ export class DysonBP01 implements AccessoryPlugin {
                     this.logging.info(messages.DEVICE_PING_STABILIZED);
                 }
             }
-        }, 700);
+        }, 2000);
     }
 
     private processStateChange(partialState: Partial<DeviceState>, state: DeviceState) {
@@ -212,7 +217,7 @@ export class DysonBP01 implements AccessoryPlugin {
                 clearInterval(interval);
                 characteristicSetCallback()
             }
-        }, 700);
+        }, 100);
     }
 
     private initServices(): void {
@@ -223,7 +228,7 @@ export class DysonBP01 implements AccessoryPlugin {
                 this.accessoryConfig.serialNumber.toUpperCase());
 
         this.services.fan.getCharacteristic(this.hap.Characteristic.Active)
-            .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(() => this.deviceState.power).bind(this))
+            .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(() => powerHapMapping[this.deviceState.power]).bind(this))
             .on(CharacteristicEventTypes.SET, this.setPower.bind(this));
 
         this.services.fan.getCharacteristic(this.hap.Characteristic.CurrentFanState)
@@ -323,10 +328,7 @@ export class DysonBP01 implements AccessoryPlugin {
     private async setPower(characteristicValue: CharacteristicValue,
                                   characteristicSetCallback: CharacteristicSetCallback): Promise<void> {
         const state = this.emulateCompletedState();
-        const hapMapping = {
-            "OFF": 0,
-            "ON": 1,
-        }[state.power];
+        const hapMapping = powerHapMapping[state.power];
 
         if (characteristicValue as number != hapMapping) {
             this.pushToQueue({
