@@ -16,10 +16,7 @@ import ping from "ping";
 import * as constants from "./constants";
 import * as messages from "./messages";
 import {v4 as uuidv4} from 'uuid';
-
-export = (api: API) => {
-    api.registerAccessory(constants.ACCESSORY_NAME, DysonBP01);
-};
+import exp from "constants";
 
 type DeviceState = {
     power: "OFF" | "ON",
@@ -34,7 +31,7 @@ type QueuedCommand = {
     id?: string
 };
 
-class DysonBP01 implements AccessoryPlugin {
+export class DysonBP01 implements AccessoryPlugin {
     private readonly logging: Logging;
     private readonly hap: HAP;
     private readonly accessoryConfig: AccessoryConfig;
