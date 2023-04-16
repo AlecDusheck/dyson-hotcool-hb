@@ -145,6 +145,8 @@ export class DysonBP01 implements AccessoryPlugin {
 
                         // Done to trigger custom setters/getters
                         this.deviceState = currentState;
+
+                        this.logging.info(JSON.stringify(this.deviceState));
                     }
                     // if (this.canUpdateCurrentActive()) {
                     //     await this.updateCurrentActive();
