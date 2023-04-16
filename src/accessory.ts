@@ -216,6 +216,7 @@ export class DysonBP01 implements AccessoryPlugin {
 
         const interval = setInterval(() => {
             if (!this.commandQueue.find(x => x.id === commandWithId.id)) {
+                this.logging.info("Calling set callback")
                 clearInterval(interval);
                 characteristicSetCallback()
             }
