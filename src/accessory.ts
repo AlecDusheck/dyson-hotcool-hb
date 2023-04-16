@@ -363,7 +363,7 @@ export class DysonBP01 implements AccessoryPlugin {
     private async setCurrentSpeed(characteristicValue: CharacteristicValue,
                                   characteristicSetCallback: CharacteristicSetCallback): Promise<void> {
         const state = this.emulateCompletedState();
-        const desiredSpeed = Math.floor(Number(characteristicValue) / 10);
+        const desiredSpeed = Math.floor((Number(characteristicValue) / 10 + 1) * 0.9);
 
         if (desiredSpeed === state.speed) {
             return;
