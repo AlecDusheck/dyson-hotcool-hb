@@ -374,12 +374,18 @@ export class DysonBP01 implements AccessoryPlugin {
             return;
         }
 
+        if (state.speed < 0 || state.speed > 10) {
+            characteristicSetCallback(new Error("Speed value not supported"));
+            return;
+        }
+
         const decrease = desiredSpeed < state.speed;
         const sign = decrease ? -1 : 1;
+        const diff = Math.abs(desiredSpeed - state.speed);
 
         // For loop which has all needed steps EXCEPT for the last step
         // last step done outside of the for loop for proper callback support
-        for(let i = 0; i < Math.abs(state.speed - desiredSpeed) - 1; i++) {
+        for(let i = 0; i < diff - 1; i++) {
             this.pushToQueue({
                 irData: decrease ? constants.IR_DATA_SPEED_DECREASE : constants.IR_DATA_SPEED_INCREASE,
                 stateChange: {
