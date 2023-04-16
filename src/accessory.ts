@@ -230,12 +230,12 @@ export class DysonBP01 implements AccessoryPlugin {
                 this.accessoryConfig.serialNumber.toUpperCase());
 
         this.services.fan.getCharacteristic(this.hap.Characteristic.Active)
-            .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(() => powerHapMapping[this.deviceState.power]).bind(this))
+            .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(state => powerHapMapping[state.power]).bind(this))
             .on(CharacteristicEventTypes.SET, this.setPower.bind(this));
 
         this.services.fan.getCharacteristic(this.hap.Characteristic.CurrentFanState)
-            .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(() => {
-                if (this.deviceState.power === "ON") {
+            .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(state => {
+                if (state.power === "ON") {
                     return this.hap.Characteristic.CurrentFanState.BLOWING_AIR;
                 }
 
@@ -244,11 +244,11 @@ export class DysonBP01 implements AccessoryPlugin {
 
 
         this.services.fan.getCharacteristic(this.hap.Characteristic.SwingMode)
-            .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(() => this.deviceState.isSwinging).bind(this))
+            .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(state => state.isSwinging).bind(this))
             .on(CharacteristicEventTypes.SET, this.setSwingMode.bind(this));
 
         this.services.fan.getCharacteristic(this.hap.Characteristic.RotationSpeed)
-            .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(() => this.deviceState.speed).bind(this))
+            .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(state => state.speed).bind(this))
             .on(CharacteristicEventTypes.SET, this.setCurrentSpeed.bind(this));
 
         /*
@@ -321,10 +321,10 @@ export class DysonBP01 implements AccessoryPlugin {
      * @param getter
      * @private
      */
-    private getCharacteristicProperty<T extends CharacteristicValue>(getter: () => T): (characteristicGetCallback: CharacteristicGetCallback) => void {
+    private getCharacteristicProperty<T extends CharacteristicValue>(getter: (state: DeviceState) => T): (characteristicGetCallback: CharacteristicGetCallback) => void {
         return (characteristicGetCallback: CharacteristicGetCallback) => {
             characteristicGetCallback(this.alive ? null : new Error(messages.DEVICE_PING_FAILED),
-                getter());
+                getter(this.emulateCompletedState()));
         }
     }
 
