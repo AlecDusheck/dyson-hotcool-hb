@@ -346,6 +346,11 @@ export class DysonBP01 implements AccessoryPlugin {
                                   characteristicSetCallback: CharacteristicSetCallback): Promise<void> {
         const state = this.emulateCompletedState();
 
+        if (state.power === "OFF") {
+            characteristicSetCallback(new Error("Fan state is off"));
+            return;
+        }
+
         if (Number(characteristicValue) != Number(state.isSwinging)) {
             this.pushToQueue({
                 irData: constants.IR_DATA_SWING_MODE,
