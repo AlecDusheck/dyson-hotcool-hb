@@ -336,7 +336,7 @@ export class DysonBP01 implements AccessoryPlugin {
             this.pushToQueue({
                 irData: constants.IR_DATA_POWER,
                 stateChange: {
-                    power: hapMapping === 0 ? "OFF" : "ON"
+                    power: characteristicValue === 0 ? "OFF" : "ON"
                 }}, characteristicSetCallback);
         }
     }
