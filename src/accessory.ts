@@ -242,11 +242,12 @@ export class DysonBP01 implements AccessoryPlugin {
                 return this.hap.Characteristic.CurrentFanState.IDLE
             }).bind(this));
 
-        /*
-        this.services.fan.getCharacteristic(this.hap.Characteristic.Active)
+
+        this.services.fan.getCharacteristic(this.hap.Characteristic.SwingMode)
             .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(() => this.deviceState.isSwinging).bind(this))
             .on(CharacteristicEventTypes.SET, this.setSwingMode.bind(this));
 
+        /*
         this.services.fan.getCharacteristic(this.hap.Characteristic.RotationSpeed)
             .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(() => this.deviceState.targetSpeed).bind(this))
             .on(CharacteristicEventTypes.SET, this.setCurrentSpeed.bind(this));
@@ -337,6 +338,19 @@ export class DysonBP01 implements AccessoryPlugin {
                 irData: constants.IR_DATA_POWER,
                 stateChange: {
                     power: characteristicValue === 0 ? "OFF" : "ON"
+                }}, characteristicSetCallback);
+        }
+    }
+
+    private async setSwingMode(characteristicValue: CharacteristicValue,
+                                  characteristicSetCallback: CharacteristicSetCallback): Promise<void> {
+        const state = this.emulateCompletedState();
+
+        if (Number(characteristicValue) != Number(state.isSwinging)) {
+            this.pushToQueue({
+                irData: constants.IR_DATA_SWING_MODE,
+                stateChange: {
+                    isSwinging: Number(characteristicValue) === 1
                 }}, characteristicSetCallback);
         }
     }
