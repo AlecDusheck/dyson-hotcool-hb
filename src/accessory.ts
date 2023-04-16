@@ -157,7 +157,7 @@ export class DysonBP01 implements AccessoryPlugin {
                     // }
                 }
             }
-        }, 300);
+        }, 600);
 
         // Interval to ping device
         setInterval(async () => {
@@ -361,6 +361,11 @@ export class DysonBP01 implements AccessoryPlugin {
         const desiredSpeed = Number(characteristicValue);
 
         if (desiredSpeed === state.speed) {
+            return;
+        }
+
+        if (state.power === "OFF") {
+            characteristicSetCallback(new Error("Fan state is off"));
             return;
         }
 
