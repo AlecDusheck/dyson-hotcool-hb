@@ -247,11 +247,11 @@ export class DysonBP01 implements AccessoryPlugin {
             .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(() => this.deviceState.isSwinging).bind(this))
             .on(CharacteristicEventTypes.SET, this.setSwingMode.bind(this));
 
-        /*
         this.services.fan.getCharacteristic(this.hap.Characteristic.RotationSpeed)
-            .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(() => this.deviceState.targetSpeed).bind(this))
+            .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(() => this.deviceState.speed).bind(this))
             .on(CharacteristicEventTypes.SET, this.setCurrentSpeed.bind(this));
 
+        /*
         // Rotation Direction = Air Straight or Wide
         this.services.fan.getCharacteristic(this.hap.Characteristic.RotationDirection)
             .on(CharacteristicEventTypes.GET, this.getCharacteristicProperty(() => {
@@ -353,5 +353,35 @@ export class DysonBP01 implements AccessoryPlugin {
                     isSwinging: Number(characteristicValue) === 1
                 }}, characteristicSetCallback);
         }
+    }
+
+    private async setCurrentSpeed(characteristicValue: CharacteristicValue,
+                                  characteristicSetCallback: CharacteristicSetCallback): Promise<void> {
+        const state = this.emulateCompletedState();
+        const desiredSpeed = Number(characteristicValue);
+
+        if (desiredSpeed === state.speed) {
+            return;
+        }
+
+        const decrease = desiredSpeed < state.speed;
+        const sign = decrease ? -1 : 1;
+
+        // For loop which has all needed steps EXCEPT for the last step
+        // last step done outside of the for loop for proper callback support
+        for(let i = 0; i < Math.abs(state.speed - desiredSpeed) - 1; i++) {
+            this.pushToQueue({
+                irData: decrease ? constants.IR_DATA_SPEED_DECREASE : constants.IR_DATA_SPEED_INCREASE,
+                stateChange: {
+                    speed: sign
+                }});
+        }
+
+        // notice the `characteristicSetCallback`
+        this.pushToQueue({
+            irData: decrease ? constants.IR_DATA_SPEED_DECREASE : constants.IR_DATA_SPEED_INCREASE,
+            stateChange: {
+                speed: sign
+            }}, characteristicSetCallback);
     }
 }
